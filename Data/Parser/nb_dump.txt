@@ -1,0 +1,1260 @@
+# Московская биржа: полный доступный архив инструментов 16 банков (ISS)
+**Google Colab · версия 2.1 · самодостаточный сборщик**
+
+Этот ноутбук выгружает все выбранные публичные группы данных MOEX ISS по обнаруженным выпускам: **многомасштабные OHLCV-свечи (1, 10, 60 минут, день, неделя, месяц), подробную дневную историю с полями торгов, банковские облигации, купоны и оферты, дивиденды, справочники эмитентов и режимов, текущие снимки рынка и ряд бенчмарков**. Сохраняются исходные столбцы каждого ответа биржи.
+
+**Ограничения:** биржа может ограничивать глубину/API/лицензии; исторический стакан и все тиковые сделки из текущих снимков не получить; полного архива банковской отчётности, новостей и макроэкономики MOEX ISS не гарантирует. Акции холдинга/материнской компании и облигации **не подменяют** акции банка. Кандидаты проверяются, ошибочные совпадения отмечаются для ручной проверки.
+
+**Внимание:** здесь нет уже скачанных котировок. Сбор данных произойдёт только при запуске этой тетрадки в Colab с интернетом. Встроенные локальные тесты не подтверждают доступность реальных API. Полный режим может потребовать значительного диска и нескольких сессий Colab.
+
+
+--- CELL ---
+
+## 1. Установка и настройки
+Используем Google Drive для сохранения многолетних данных между сессиями. При необходимости отключи `USE_GOOGLE_DRIVE`.
+
+--- CELL ---
+
+%pip -q install -U "certifi" "requests>=2.31" "urllib3" "pandas>=2.2,<3" "pyarrow>=14" "pytest>=7"
+
+
+--- CELL ---
+
+import json
+from datetime import date
+from pathlib import Path
+
+USE_GOOGLE_DRIVE = True
+if USE_GOOGLE_DRIVE:
+    from google.colab import drive
+    drive.mount('/content/drive')
+    OUT = Path('/content/drive/MyDrive/MOEX_BANKS_FULL_ISS')
+else:
+    OUT = Path('/content/MOEX_BANKS_FULL_ISS')
+OUT.mkdir(parents=True, exist_ok=True)
+
+# Полная конфигурация. МИНУТНЫЕ свечи + ВСЕ найденные облигации = очень большой объём.
+# Укажи путь к доверенному PEM bundle, только если стандартная цепочка CA не проходит.
+# Сначала проверь HTTPS_PROXY / REQUESTS_CA_BUNDLE, диагностическая ячейка ниже подскажет причину.
+# Никогда не устанавливай verify=False для данных рынка.
+TLS_CA_BUNDLE = ''  # например, '/content/drive/MyDrive/certs/combined-ca.pem'
+USE_ENV_PROXY = True
+
+CFG = {
+    'tls_ca_bundle': TLS_CA_BUNDLE,
+    'use_env_proxy': USE_ENV_PROXY,
+    'start': '1990-01-01', 'end': date.today().isoformat(),
+    'include_bonds': True, 'include_other_bank_issues': True,
+    'all_boards': True,
+    'share_intervals': [1, 10, 60, 24, 7, 31],
+    'bond_intervals': [60, 24],
+    'benchmark_intervals': [60, 24],
+    'benchmarks': ['IMOEX', 'MOEXFN', 'RGBI'],
+    'fx_instruments': ['USD000UTSTOM'],
+    'include_daily_history': True, 'include_snapshots': True,
+    'include_corporate_reference': True, 'include_market_reference': True,
+    'download_candles': True,
+    'refresh_current_year': True, 'refresh_discovery': False, 'refresh': False,
+    'pause_seconds': 0.30,
+    'max_requests_per_run': 0,  # 0 — без предельного числа запросов; можно выставить 1000
+    'max_search_pages_per_query': 100,
+    'max_securities': 0,  # 0 — все инструменты; для пробного запуска, например, 10
+}
+(OUT / 'user_config.json').write_text(json.dumps(CFG, indent=2, ensure_ascii=False), encoding='utf-8')
+print('Папка результатов:', OUT, 'Период:', CFG['start'], '—', CFG['end'])
+
+
+--- CELL ---
+
+### Предварительная проверка HTTPS-соединения с MOEX
+
+Проверяем сертификат и доступность публичного API до запуска тяжёлой выгрузки. Япония как местоположение пользователя не означает, что сервер Colab расположен в Японии. Если проверка не проходит, дальнейшая загрузка не запускается.
+
+Если в журнале видна `self-signed certificate in certificate chain`, вероятны HTTPS-прокси или нестандартная цепочка сертификации. Установка `certifi` устраняет только часть таких ошибок. Пользовательский файл `TLS_CA_BUNDLE` должен содержать **проверенные доверенные корневые сертификаты**, а не неизвестный сертификат, скачанный из ошибочного соединения.
+
+
+--- CELL ---
+
+# Безопасная диагностика SSL: verify=False НЕ используется.
+import os
+import ssl
+import certifi
+import requests
+from pathlib import Path
+
+TEST_URL = 'https://iss.moex.com/iss/engines.json'
+print('OpenSSL:', ssl.OPENSSL_VERSION)
+print('Requests:', requests.__version__)
+print('Certifi bundle:', certifi.where())
+print('HTTPS_PROXY задан:', bool(os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy')))
+print('REQUESTS_CA_BUNDLE задан:', bool(os.environ.get('REQUESTS_CA_BUNDLE')))
+print('CURL_CA_BUNDLE задан:', bool(os.environ.get('CURL_CA_BUNDLE')))
+
+_ca_path = CFG.get('tls_ca_bundle') or certifi.where()
+if not Path(_ca_path).is_file():
+    raise FileNotFoundError('Не найден PEM bundle: ' + _ca_path)
+_s = requests.Session()
+_s.verify = _ca_path
+_s.trust_env = CFG.get('use_env_proxy', True)
+try:
+    _r = _s.get(TEST_URL, params={'iss.meta':'off'}, timeout=(15, 25))
+    _r.raise_for_status()
+    _json = _r.json()
+    assert isinstance(_json, dict), 'Неожиданный ответ API: ожидали JSON object'
+    print('MOEX ISS HTTPS OK. HTTP', _r.status_code, 'разделы:', list(_json)[:10])
+except requests.exceptions.SSLError as exc:
+    raise RuntimeError(
+        'Не удалось проверить TLS-сертификат MOEX. Это НЕ доказательство блокировки в Японии. '
+        'Обновлённый certifi уже используется. Проверь настройки HTTPS_PROXY, корпоративный/VPN прокси, '
+        'подлинность цепочки сертификатов и при необходимости передай доверенный объединённый PEM в TLS_CA_BUNDLE. '
+        'Не отключай SSL-проверку.'
+    ) from exc
+except requests.exceptions.RequestException as exc:
+    raise RuntimeError('MOEX ISS недоступен через текущую сеть/прокси. Диагностика: ' + str(exc)) from exc
+
+
+--- CELL ---
+
+## 2. Самодостаточный исходный код
+Сохраняем на диск исходник, встроенный в notebook. Дальше никаких внешних скриптов загружать не потребуется.
+
+--- CELL ---
+
+%%writefile /content/collector.py
+#!/usr/bin/env python3
+"""MOEX ISS bank securities research dataset builder, v2.1.
+
+No external quote vendor, no synthetic observations, no ticker stitching.
+Dataset partitions are atomic and independently reusable. Historical order book is
+NOT provided by standard public ISS snapshots.
+"""
+from __future__ import annotations
+
+import argparse
+import gzip
+import hashlib
+import json
+import math
+import os
+import re
+import sys
+import time
+from collections import Counter, defaultdict
+from datetime import date, datetime, timezone
+from pathlib import Path
+from urllib.parse import quote
+
+import pandas as pd
+import certifi
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+BASE = 'https://iss.moex.com'
+VERSION = '2.1.0'
+BANKS = [
+    dict(bank='Сбербанк', aliases=['Сбербанк', 'Сбербанк России'], anchors=['сбербанк'], equity=['SBER', 'SBERP']),
+    dict(bank='ВТБ', aliases=['Банк ВТБ', 'ВТБ'], anchors=['банк втб'], equity=['VTBR']),
+    dict(bank='Газпромбанк', aliases=['Газпромбанк'], anchors=['газпромбанк'], equity=[]),
+    dict(bank='Альфа-Банк', aliases=['Альфа-Банк'], anchors=['альфа банк'], equity=[]),
+    dict(bank='Банк ПСБ', aliases=['Промсвязьбанк', 'Банк ПСБ'], anchors=['промсвязьбанк', 'банк псб'], equity=[]),
+    dict(bank='Россельхозбанк', aliases=['Россельхозбанк'], anchors=['россельхозбанк'], equity=[]),
+    dict(bank='Т-Банк', aliases=['Т-Банк', 'Тинькофф Банк'], anchors=['т банк', 'тинькофф банк'], equity=['T', 'TCSG']),
+    dict(bank='Банк ДОМ.РФ', aliases=['Банк ДОМ.РФ'], anchors=['банк дом рф'], equity=['DOMRF']),
+    dict(bank='Московский кредитный банк', aliases=['Московский кредитный банк', 'МКБ'], anchors=['московский кредитный банк'], equity=['CBOM']),
+    dict(bank='Совкомбанк', aliases=['Совкомбанк'], anchors=['совкомбанк'], equity=['SVCB']),
+    dict(bank='Райффайзенбанк', aliases=['Райффайзенбанк'], anchors=['райффайзенбанк'], equity=[]),
+    dict(bank='ЮниКредит Банк', aliases=['ЮниКредит Банк'], anchors=['юникредит банк'], equity=[]),
+    dict(bank='Новиком', aliases=['Новикомбанк', 'Новиком'], anchors=['новикомбанк', 'банк новиком'], equity=[]),
+    dict(bank='Банк «Россия»', aliases=['Банк Россия'], anchors=['банк россия'], equity=[]),
+    dict(bank='Банк «Санкт-Петербург»', aliases=['Банк Санкт-Петербург'], anchors=['банк санкт петербург'], equity=['BSPB', 'BSPBP']),
+    dict(bank='Ак Барс Банк', aliases=['Ак Барс Банк'], anchors=['ак барс банк'], equity=[]),
+]
+SEED_RELATION = {
+    'SBER': 'direct_share', 'SBERP': 'direct_share', 'VTBR': 'direct_share',
+    'T': 'holding_company_share_proxy', 'TCSG': 'historical_holding_depositary_receipt',
+    'DOMRF': 'parent_company_candidate_NOT_bank_share',
+    'CBOM': 'direct_share', 'SVCB': 'direct_share', 'BSPB': 'direct_share', 'BSPBP': 'direct_share',
+}
+# The ISS availability of the DOMRF candidate is checked at runtime, not assumed.
+DEFAULTS = {
+    'start': '1990-01-01', 'end': None, 'include_bonds': True,
+    'tls_ca_bundle': '', 'use_env_proxy': True,
+    'include_other_bank_issues': True, 'all_boards': True,
+    'share_intervals': [1, 10, 60, 24, 7, 31],
+    'bond_intervals': [60, 24], 'other_intervals': [24],
+    'benchmark_intervals': [60, 24],
+    'benchmarks': ['IMOEX', 'MOEXFN', 'RGBI'],
+    'fx_instruments': ['USD000UTSTOM'],
+    'include_daily_history': True, 'include_snapshots': True,
+    'include_corporate_reference': True, 'include_market_reference': True,
+    'download_candles': True, 'refresh': False,
+    'refresh_current_year': True, 'pause_seconds': 0.30,
+    'max_requests_per_run': 0, 'max_search_pages_per_query': 100,
+    'max_securities': 0, 'max_pages_per_partition': 30000,
+    'refresh_discovery': False, 'refresh_snapshots_daily': False,
+    'max_snapshot_trades_pages': 200, 'validate_equity_issuer_match': False,
+}
+
+
+def now_utc():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def safe(x):
+    return re.sub(r'[^A-Za-z0-9_.=-]', '_', str(x))[:160]
+
+
+def normalize(s):
+    return re.sub(r'\s+', ' ', re.sub(r'[^0-9a-zа-я]+', ' ', str(s or '').lower().replace('ё', 'е'))).strip()
+
+
+def tbl(body, name):
+    x = body.get(name)
+    if not isinstance(x, dict) or not isinstance(x.get('columns'), list) or not isinstance(x.get('data'), list):
+        return None
+    cols = [str(c).lower() for c in x['columns']]
+    return [dict(zip(cols, row)) for row in x['data']]
+
+
+def cursor(body, table):
+    x = tbl(body, table + '.cursor')
+    return x[0] if x else {}
+
+
+def asint(v, default=None):
+    try:
+        return int(v)
+    except (ValueError, TypeError, OverflowError):
+        return default
+
+
+def dump_json(path, obj):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + '.tmp')
+    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False, default=str, allow_nan=False), encoding='utf-8')
+    os.replace(tmp, path)
+
+
+def dump_gzip(path, obj):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + '.tmp')
+    with gzip.open(tmp, 'wt', encoding='utf-8') as f:
+        json.dump(obj, f, ensure_ascii=False, default=str, allow_nan=False)
+    os.replace(tmp, path)
+
+
+def save_table(path_stem, rows, extra=None):
+    """Save arbitrary ISS columns; try parquet and fall back to compressed CSV."""
+    p = Path(path_stem)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        return None
+    df = pd.DataFrame.from_records(rows)
+    for col in df.select_dtypes(include=['object']).columns:
+        if df[col].map(lambda v: isinstance(v, (list, dict))).any():
+            df[col] = df[col].map(lambda v: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v)
+    for k, v in (extra or {}).items():
+        if k in df.columns:
+            df['_source_' + k] = v
+        else:
+            df[k] = v
+    try:
+        target = p.with_suffix('.parquet')
+        tmp = Path(str(target) + '.tmp')
+        df.to_parquet(tmp, index=False)
+        os.replace(tmp, target)
+    except (Exception,):
+        target = p.with_suffix('.csv.gz')
+        tmp = Path(str(target) + '.tmp')
+        df.to_csv(tmp, compression='gzip', index=False, encoding='utf-8')
+        os.replace(tmp, target)
+    return str(target)
+
+
+class HTTPProblem(Exception):
+    def __init__(self, status, msg):
+        super().__init__(msg)
+        self.status = status
+
+
+class Client:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.calls = 0
+        self.last = 0.0
+        self.session = requests.Session()
+        self.session.verify = cfg.get('tls_ca_bundle') or certifi.where()
+        self.session.trust_env = bool(cfg.get('use_env_proxy', True))
+        retry = Retry(total=5, connect=5, read=5, backoff_factor=1,
+                      status_forcelist=[429, 500, 502, 503, 504],
+                      allowed_methods=['GET'], respect_retry_after_header=True)
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount('https://', adapter)
+        self.session.headers.update({'User-Agent': 'MOEX-bank-research-dataset/2.1 educational ISS client',
+                                     'Accept': 'application/json'})
+
+    def get(self, endpoint, **params):
+        limit = asint(self.cfg.get('max_requests_per_run'), 0) or 0
+        if limit and self.calls >= limit:
+            raise HTTPProblem('LIMIT', 'Request limit reached; restart notebook to resume saved partitions')
+        pause = float(self.cfg['pause_seconds']) - (time.monotonic() - self.last)
+        if pause > 0:
+            time.sleep(pause)
+        url = BASE + endpoint
+        try:
+            r = self.session.get(url, params={**params, 'iss.meta': 'off'}, timeout=(15, 75))
+            self.calls += 1
+            self.last = time.monotonic()
+            if r.status_code >= 400:
+                raise HTTPProblem(r.status_code, f'{r.status_code}: {r.url}: {r.text[:200]}')
+            result = r.json()
+            if not isinstance(result, dict):
+                raise HTTPProblem('JSON', 'Expected object: ' + r.url)
+            return result
+        except HTTPProblem:
+            raise
+        except requests.exceptions.SSLError as exc:
+            raise HTTPProblem('TLS_CERTIFICATE',
+                f'{url}: SSL certificate verification failed; check CA bundle / HTTPS proxy. {exc}') from exc
+        except Exception as exc:
+            raise HTTPProblem('NETWORK', f'{url}: {exc}') from exc
+
+    def pages(self, endpoint, table, params=None, max_pages=None):
+        """Fetch a complete paginated ISS table; fail closed on repeated pages/cursor mismatch."""
+        params = dict(params or {})
+        seen = set()
+        rows = []
+        offset = 0
+        page_no = 0
+        total = None
+        max_pages = max_pages or int(self.cfg['max_pages_per_partition'])
+        while True:
+            body = self.get(endpoint, **params, start=offset)
+            batch = tbl(body, table)
+            if batch is None:
+                raise ValueError(f'Missing ISS table {table}: {endpoint}; tables={list(body)}')
+            page_no += 1
+            if not batch:
+                break
+            sig = hashlib.sha256(json.dumps([batch[0], batch[-1], len(batch)], sort_keys=True, default=str).encode()).hexdigest()
+            if sig in seen:
+                raise ValueError(f'ISS repeated a page while paginating: {endpoint} {params}, offset={offset}')
+            seen.add(sig)
+            info = cursor(body, table)
+            got_total = asint(info.get('total'))
+            if got_total is not None:
+                if total is not None and total != got_total:
+                    raise ValueError(f'ISS cursor TOTAL changed: {total}->{got_total}: {endpoint}')
+                total = got_total
+            rows.extend(batch)
+            offset += len(batch)
+            if total is not None and offset >= total:
+                break
+            if page_no >= max_pages:
+                raise ValueError(f'Safety page cap exceeded: {endpoint}')
+        if total is not None and len(rows) != total:
+            raise ValueError(f'ISS cursor mismatch: expected {total}, received {len(rows)}: {endpoint}')
+        return rows, {'pages': page_no, 'cursor_total': total}
+
+
+class Builder:
+    def __init__(self, out, cfg):
+        self.out = Path(out)
+        self.cfg = {**DEFAULTS, **cfg}
+        self.cfg['end'] = self.cfg['end'] or datetime.now().date().isoformat()
+        if self.cfg['start'] > self.cfg['end']:
+            raise ValueError('start must be <= end')
+        self.c = Client(self.cfg)
+        self.journal = []
+        self.issues = []
+        self.audits = []
+        self.mappings = []
+        self.discoveries = []
+        self.verified_meta = {}
+        self.optional_unavailable = []
+        self.stop_reason = None
+        self.out.mkdir(parents=True, exist_ok=True)
+        dump_json(self.out / 'config_and_provenance.json', {'config': self.cfg, 'base': BASE,
+                  'version': VERSION, 'started_utc': now_utc(),
+                  'price_adjustment': 'none', 'market_timestamp': 'exchange local timestamps, NOT UTC'})
+
+    def log_error(self, step, bank, secid, endpoint, error):
+        item = dict(utc=now_utc(), step=step, bank=bank, secid=secid, endpoint=endpoint,
+                    error_type=type(error).__name__, status_code=getattr(error, 'status', ''), message=str(error)[:1200])
+        self.issues.append(item)
+        print('[ERROR]', step, secid, str(error)[:160], flush=True)
+        with (self.out / 'errors.jsonl').open('a', encoding='utf-8') as f:
+            f.write(json.dumps(item, ensure_ascii=False) + '\n')
+
+    def log_optional_unavailable(self, step, bank, secid, endpoint, error):
+        entry = {'step': step, 'bank': bank, 'secid': secid, 'endpoint': endpoint,
+                 'http_status': getattr(error, 'status', None), 'note': str(error)[:300]}
+        self.optional_unavailable.append(entry)
+
+    def store(self, stem, rows, kind, bank='', secid='', section='', interval=None, params=None, pageinfo=None, is_history=False):
+        stem = self.out / stem
+        side = Path(str(stem) + '.meta.json')
+        prev = None
+        if side.exists():
+            try:
+                prev = json.loads(side.read_text(encoding='utf-8'))
+            except Exception:
+                pass
+        if prev and prev.get('status') in ['OK', 'EMPTY'] and not self.cfg['refresh']:
+            # Only active/current year is ever refreshed by default.
+            year = (params or {}).get('year')
+            if not (self.cfg['refresh_current_year'] and str(year) == self.cfg['end'][:4]):
+                self.journal.append({**prev, 'status': 'CACHE'})
+                return
+        try:
+            audit = audit_rows(rows, kind, secid)
+            self.audits.append({**audit, 'kind': kind, 'bank': bank, 'secid': secid, 'section': section,
+                                'interval': interval, 'file_stem': str(stem.relative_to(self.out))})
+            extra = {'_bank': bank, '_secid': secid, '_section': section,
+                     '_downloaded_utc': now_utc(), '_source': 'MOEX_ISS'}
+            if interval is not None:
+                extra['_interval_code'] = interval
+            file = save_table(stem, rows, extra) if rows else None
+            entry = {'status': 'OK' if rows else 'EMPTY', 'rows': len(rows), 'file': file,
+                     'utc': now_utc(), 'kind': kind, 'bank': bank, 'secid': secid,
+                     'section': section, 'interval': interval, 'params': params,
+                     'pages': pageinfo or {}, 'columns': sorted(rows[0]) if rows else [],
+                     'qa': audit}
+            dump_json(side, entry)
+            self.journal.append(entry)
+        except Exception as e:
+            self.log_error('store', bank, secid, str(stem), e)
+
+    def fetch(self, stem, endpoint, table, kind, bank='', secid='', section='', interval=None, params=None, yearly=False):
+        stem = self.out / stem
+        side = Path(str(stem) + '.meta.json')
+        year = (params or {}).get('year')
+        if side.exists() and not self.cfg['refresh']:
+            try:
+                entry = json.loads(side.read_text(encoding='utf-8'))
+                is_current = bool(self.cfg['refresh_current_year'] and str(year) == self.cfg['end'][:4])
+                fetched_today = str(entry.get('utc', ''))[:10] == datetime.now(timezone.utc).date().isoformat()
+                if (entry['status'] in ('OK', 'EMPTY')
+                    and (not is_current or fetched_today)
+                    and entry.get('params') == params
+                    and (entry['status'] == 'EMPTY' or (entry.get('file') and Path(entry['file']).exists()))):
+                    self.journal.append({**entry, 'status': 'CACHE'})
+                    return
+            except Exception:
+                pass
+        try:
+            req = {k: v for k, v in (params or {}).items() if k != 'year'}
+            rows, info = self.c.pages(endpoint, table, params=req)
+            self.store(stem.relative_to(self.out), rows, kind, bank, secid, section, interval, params, info, is_history=yearly)
+        except Exception as e:
+            self.log_error('fetch_' + kind, bank, secid, endpoint, e)
+            if getattr(e, 'status', None) == 'LIMIT':
+                raise
+
+    def source_info(self):
+        if not self.cfg['include_market_reference']:
+            return
+        refs = [('/iss/engines.json', 'engines'),
+                ('/iss/engines/stock/markets.json', 'markets'),
+                ('/iss/engines/stock/markets/shares/boards.json', 'boards'),
+                ('/iss/engines/stock/markets/bonds/boards.json', 'boards'),
+                ('/iss/engines/stock/markets/index/boards.json', 'boards')]
+        for endpoint, title in refs:
+            try:
+                body = self.c.get(endpoint)
+                dump_gzip(self.out / 'reference' / (safe(title + '_' + endpoint) + '.json.gz'),
+                          {'url': endpoint, 'retrieved_utc': now_utc(), 'body': body})
+            except Exception as e:
+                self.log_error('market_reference', '', '', endpoint, e)
+
+    def search(self, bank_rec):
+        seen = {}
+        for query in bank_rec['aliases']:
+            endpoint = '/iss/securities.json'
+            try:
+                rows, info = self.c.pages(endpoint, 'securities',
+                                         params={'q': query}, max_pages=int(self.cfg['max_search_pages_per_query']))
+                for r in rows:
+                    id_ = r.get('secid')
+                    if id_:
+                        r['_found_by_queries'] = [query]
+                        if id_ in seen:
+                            seen[id_]['_found_by_queries'].append(query)
+                        else:
+                            seen[id_] = r
+                print('  SEARCH', bank_rec['bank'], query, len(rows), 'rows', flush=True)
+            except Exception as e:
+                self.log_error('search', bank_rec['bank'], '', endpoint + '?q=' + query, e)
+                if getattr(e, 'status', None) == 'LIMIT':
+                    raise
+        return list(seen.values())
+
+    def match(self, r, bank_rec):
+        issuer = normalize(r.get('emitent_title') or r.get('issuer') or '')
+        anchors = bank_rec['anchors']
+        # For short aliases (VTB) require full-word token matches; do not match Gazprom to Gazprombank.
+        # Distinguish bank issuer from subsidiaries (leasing, factoring, insurance, SPVs).
+        affiliate_words = ('лизинг', 'факторинг', 'страхован', 'ипотечн агент', 'специализированн финансов',
+                           'сбербанк технологии', 'vtb leasing')
+        is_affiliate = any(s in issuer for s in affiliate_words)
+        if issuer and not is_affiliate and any(re.search(r'(?<![а-яa-z0-9])' + re.escape(k) + r'(?![а-яa-z0-9])', issuer)
+                          for k in anchors):
+            return 'issuer_name_match__REVIEW'
+        full_name = normalize(' '.join([str(r.get('shortname', '')), str(r.get('name', ''))]))
+        if any(re.search(r'(?<![а-яa-z0-9])' + re.escape(k) + r'(?![а-яa-z0-9])', full_name)
+               for k in anchors):
+            return 'name_only__REVIEW_NOT_DOWNLOADED'
+        return 'search_hit_unrelated__NOT_DOWNLOADED'
+
+    def classify(self, item):
+        s = normalize(' '.join(str(item.get(k, '')) for k in ['group', 'type', 'name', 'shortname']))
+        group = str(item.get('group') or '').lower()
+        if 'bond' in group or 'облигац' in s or ' bond' in ' ' + s:
+            return 'bonds'
+        if 'share' in group or 'акци' in s or 'депозитарн' in s or 'depositary' in s:
+            return 'shares'
+        return 'other'
+
+    def get_meta(self, secid):
+        if secid in self.verified_meta:
+            return self.verified_meta[secid]
+        endpoint = '/iss/securities/' + quote(secid, safe='') + '.json'
+        cache = self.out / 'reference' / 'securities' / (safe(secid) + '.json.gz')
+        if cache.exists() and not self.cfg['refresh_discovery']:
+            with gzip.open(cache, 'rt', encoding='utf-8') as f:
+                body = json.load(f)['body']
+        else:
+            body = self.c.get(endpoint)
+        sec = tbl(body, 'securities') or []
+        boards = tbl(body, 'boards') or []
+        if not sec:
+            raise ValueError('ISS did not return securities section')
+        self.verified_meta[secid] = (sec[0], boards, body)
+        dump_gzip(self.out / 'reference' / 'securities' / (safe(secid) + '.json.gz'),
+                  {'url': endpoint, 'retrieved_utc': now_utc(), 'body': body})
+        return self.verified_meta[secid]
+
+    def discover(self):
+        cache = self.out / 'reference' / 'bank_security_map.json'
+        discovery_key = {k: self.cfg[k] for k in ('include_bonds', 'include_other_bank_issues',
+                                                   'all_boards', 'max_securities')}
+        meta_cache = self.out / 'reference' / 'discovery_config.json'
+        if cache.exists() and meta_cache.exists() and not self.cfg['refresh_discovery']:
+            old_key = json.loads(meta_cache.read_text(encoding='utf-8'))
+            if old_key == discovery_key:
+                self.mappings = json.loads(cache.read_text(encoding='utf-8'))
+                print('[DISCOVERY CACHE]', len(self.mappings), 'securities', flush=True)
+                return self.mappings
+        catalog = {}
+        for bank in BANKS:
+            for secid in bank['equity']:
+                catalog[(bank['bank'], secid)] = {'bank': bank['bank'], 'secid': secid,
+                    'relation': SEED_RELATION[secid], 'selection': 'curated_equity_seed__VERIFY_BY_ISS',
+                    'asset_hint': 'shares'}
+            results = self.search(bank)
+            for r in results:
+                match = self.match(r, bank)
+                row = {**r, '_bank': bank['bank'], '_match_status': match,
+                       '_kind_hint': self.classify(r)}
+                self.discoveries.append(row)
+                secid = r.get('secid')
+                if not secid or match != 'issuer_name_match__REVIEW':
+                    continue
+                kind = self.classify(r)
+                if kind == 'bonds' and not self.cfg['include_bonds']:
+                    continue
+                if kind == 'other' and not self.cfg['include_other_bank_issues']:
+                    continue
+                # New share candidates are retained as unconfirmed issuer-linked instruments.
+                # Their ISS boards and issuer descriptions are independently verified next.
+                catalog.setdefault((bank['bank'], secid), {'bank': bank['bank'], 'secid': secid,
+                           'relation': 'issuer_candidate_name_match__VERIFY', 'selection': 'issuer_heuristic__REVIEW',
+                           'asset_hint': kind, 'issuer_title': r.get('emitent_title'),
+                           'isin': r.get('isin'), 'name': r.get('name')})
+        self.store('reference/discovery_results', self.discoveries, 'discovery')
+        max_sec = asint(self.cfg['max_securities'], 0)
+        raw = list(catalog.values())
+        # Preserve seed priority before issuer candidates when max_securities is configured.
+        if max_sec and max_sec > 0:
+            raw = raw[:max_sec]
+        for item in raw:
+            try:
+                info, boards, _ = self.get_meta(item['secid'])
+                item['verified_exists_in_iss'] = True
+                item['sec_name'] = info.get('name') or info.get('shortname')
+                item['iss_group'] = info.get('group')
+                item['boards'] = boards
+                if item['selection'].startswith('issuer_heuristic'):
+                    issuer = normalize(info.get('emitent_title') or item.get('issuer_title') or '')
+                    bank_rec = next(b for b in BANKS if b['bank'] == item['bank'])
+                    item['issuer_name_confirmed_against_details'] = (
+                        self.match({'emitent_title': issuer}, bank_rec) == 'issuer_name_match__REVIEW')
+                    if not item['issuer_name_confirmed_against_details']:
+                        item['eligible_boards'] = []
+                        item['selection'] = 'ISS_DETAIL_ISSUER_MISMATCH__SKIPPED'
+                item['eligible_boards'] = self.boards_for(item)
+                print('[SEC]', item['secid'], item['bank'], item['asset_hint'], len(item['eligible_boards']), 'boards', flush=True)
+            except Exception as e:
+                item['verified_exists_in_iss'] = False
+                item['eligible_boards'] = []
+                self.log_error('security_metadata', item['bank'], item['secid'], 'securities/{secid}', e)
+                if getattr(e, 'status', None) == 'LIMIT':
+                    raise
+            self.mappings.append(item)
+        dump_json(self.out / 'reference' / 'bank_security_map.json', self.mappings)
+        dump_json(meta_cache, discovery_key)
+        pd.DataFrame([{k: v for k, v in i.items() if k not in ('boards', 'eligible_boards')}
+                      for i in self.mappings]).to_csv(self.out / 'reference' / 'bank_security_map.csv', index=False, encoding='utf-8-sig')
+        return self.mappings
+
+    def boards_for(self, item):
+        boards = [x for x in item['boards'] if str(x.get('engine') or '').lower() == 'stock'
+                  and x.get('market') in ('shares', 'bonds')]
+        kind = item['asset_hint']
+        if kind == 'shares':
+            boards = [b for b in boards if b.get('market') == 'shares']
+        elif kind == 'bonds':
+            boards = [b for b in boards if b.get('market') == 'bonds']
+        if not self.cfg['all_boards']:
+            selected = [b for b in boards if asint(b.get('is_primary'), 0) == 1]
+            boards = selected or [b for b in boards if asint(b.get('is_traded'), 0) == 1]
+            boards = boards[:1]
+        # Keep board history dates - with multiple modes a price series is not a single continuous share price.
+        return sorted(boards, key=lambda x: str(x.get('boardid')))
+
+    def date_intervals(self, board):
+        start = self.cfg['start']
+        end = self.cfg['end']
+        lo = str(board.get('history_from') or board.get('traded_from') or '')[:10]
+        hi = str(board.get('history_till') or '')[:10]
+        if re.fullmatch(r'\d{4}-\d{2}-\d{2}', lo):
+            start = max(start, lo)
+        if re.fullmatch(r'\d{4}-\d{2}-\d{2}', hi):
+            end = min(end, hi)
+        if start > end:
+            return []
+        periods = []
+        for year in range(int(start[:4]), int(end[:4]) + 1):
+            a, b = max(start, f'{year}-01-01'), min(end, f'{year}-12-31')
+            periods.append((year, a, b))
+        return periods
+
+    def download_history(self, item, board):
+        secid, bank = item['secid'], item['bank']
+        engine, market, bid = 'stock', board['market'], board['boardid']
+        root = f'/iss/history/engines/{engine}/markets/{market}/boards/{quote(bid, safe="")}/securities/{quote(secid, safe="")}.json'
+        for year, a, b in self.date_intervals(board):
+            stem = f'data/{safe(market)}/daily_market_history/{safe(secid)}/{safe(bid)}/{year}'
+            self.fetch(stem, root, 'history', 'history', bank=bank, secid=secid,
+                       section=f'{market}/{bid}', params={'from': a, 'till': b, 'year': year}, yearly=True)
+
+    def download_candles(self, item, board, interval_override=None):
+        if not self.cfg['download_candles']:
+            return
+        secid, bank = item['secid'], item['bank']
+        market, bid = board['market'], board['boardid']
+        intervals = interval_override or (self.cfg['share_intervals'] if market == 'shares' else
+                     self.cfg['bond_intervals'] if market == 'bonds' else self.cfg['other_intervals'])
+        url = f'/iss/engines/stock/markets/{market}/boards/{quote(bid, safe="")}/securities/{quote(secid, safe="")}/candles.json'
+        for interval in intervals:
+            for year, a, b in self.date_intervals(board):
+                stem = f'data/{safe(market)}/candles/interval_{interval}/{safe(secid)}/{safe(bid)}/{year}'
+                self.fetch(stem, url, 'candles', 'candles', bank=bank, secid=secid,
+                           section=f'{market}/{bid}', interval=interval,
+                           params={'interval': interval, 'from': a, 'till': b, 'year': year}, yearly=True)
+
+    def get_reference(self, item):
+        if not self.cfg['include_corporate_reference']:
+            return
+        secid = item['secid']
+        base = '/iss/securities/' + quote(secid, safe='')
+        if item['asset_hint'] == 'shares':
+            endpoints = [(base + '/dividends.json', 'dividends', 'dividends'),
+                         (base + '/indices.json', 'indices', 'indices')]
+        else:
+            endpoints = [(base + '/bondization.json', 'bondization', None)]
+        for endpoint, title, table in endpoints:
+            stem_base = self.out / 'corporate' / safe(secid) / title
+            if (Path(str(stem_base) + '.json.gz')).exists() and not self.cfg['refresh']:
+                # corporate reference may change; one-time refresh of current year managed by --refresh.
+                continue
+            try:
+                body = self.c.get(endpoint)
+                dump_gzip(str(stem_base) + '.json.gz', {'url': endpoint, 'utc': now_utc(), 'body': body})
+                for t in ([table] if table else list(body)):
+                    rows = tbl(body, t)
+                    if rows is not None:
+                        self.store(f'corporate/{safe(secid)}/{title}_{safe(t)}', rows,
+                                   'corporate', bank=item['bank'], secid=secid, section=t)
+            except Exception as e:
+                if getattr(e, 'status', None) in (400, 404):
+                    self.log_optional_unavailable('corporate_' + title, item['bank'], secid, endpoint, e)
+                    continue
+                self.log_error('corporate_' + title, item['bank'], secid, endpoint, e)
+                if getattr(e, 'status', None) == 'LIMIT':
+                    raise
+
+    def snapshots(self, item, board):
+        if not self.cfg['include_snapshots']:
+            return
+        market, bid = board['market'], board['boardid']
+        secid = item['secid']
+        # These endpoints are CURRENT snapshots only. Do not label as a historical L2 book/tick archive.
+        base = f'/iss/engines/stock/markets/{market}/boards/{quote(bid, safe="")}/securities/{quote(secid, safe="")}'
+        key = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        day = key[:8]
+        day_existing = (self.out / 'snapshots' / safe(market) / safe(secid) / safe(bid))
+        if day_existing.exists() and list(day_existing.glob(day + '*')) and not self.cfg['refresh_snapshots_daily']:
+            return
+        for suffix in ['', '/orderbook', '/trades']:
+            endpoint = base + suffix + '.json'
+            title = 'marketdata' if not suffix else suffix.strip('/')
+            try:
+                body = self.c.get(endpoint)
+                stem = f'snapshots/{safe(market)}/{safe(secid)}/{safe(bid)}/{key}_{title}'
+                dump_gzip(self.out / (stem + '.json.gz'),
+                          {'url': endpoint, 'retrieved_utc': now_utc(), 'snapshot_only': True, 'body': body,
+                           'first_page_only': title == 'trades'})
+                # The first page is always preserved. Pagination is attempted for the
+                # latest available trades only, not for a historical tick archive.
+                if title == 'trades' and cursor(body, 'trades'):
+                    try:
+                        trade_rows, info = self.c.pages(endpoint, 'trades',
+                                            max_pages=int(self.cfg['max_snapshot_trades_pages']))
+                        self.store(stem + '_trades_paginated', trade_rows, 'snapshot',
+                                   bank=item['bank'], secid=secid, section='trades_paginated', pageinfo=info)
+                    except Exception as e:
+                        self.log_error('snapshot_trades_pagination', item['bank'], secid, endpoint, e)
+                        if getattr(e, 'status', None) == 'LIMIT':
+                            raise
+                for tbl_name, block in body.items():
+                    if tbl_name.endswith('.cursor') or not isinstance(block, dict):
+                        continue
+                    rows = tbl(body, tbl_name)
+                    if rows is not None:
+                        self.store(stem + '_' + safe(tbl_name), rows,
+                                   'snapshot', bank=item['bank'], secid=secid, section=tbl_name)
+            except Exception as e:
+                if getattr(e, 'status', None) in (400, 404):
+                    self.log_optional_unavailable('snapshot_' + title, item['bank'], secid, endpoint, e)
+                    continue
+                self.log_error('snapshot_' + title, item['bank'], secid, endpoint, e)
+                if getattr(e, 'status', None) == 'LIMIT':
+                    raise
+
+    def benchmarks(self):
+        for secid in self.cfg['benchmarks'] + self.cfg['fx_instruments']:
+            engine, market = ('currency', 'selt') if secid in self.cfg['fx_instruments'] else ('stock', 'index')
+            for interval in self.cfg['benchmark_intervals']:
+                url = f'/iss/engines/{engine}/markets/{market}/securities/{quote(secid, safe="")}/candles.json'
+                for year in range(int(self.cfg['start'][:4]), int(self.cfg['end'][:4]) + 1):
+                    a, b = max(self.cfg['start'], f'{year}-01-01'), min(self.cfg['end'], f'{year}-12-31')
+                    stem = f'benchmarks/{safe(secid)}/interval_{interval}/{year}'
+                    self.fetch(stem, url, 'candles', 'candles', bank='BENCHMARK_NOT_A_BANK', secid=secid,
+                               section=f'{engine}/{market}', interval=interval,
+                               params={'interval': interval, 'from': a, 'till': b, 'year': year}, yearly=True)
+
+    def build_hourly(self):
+        """Convenience file: direct/holding equity only; does not combine different tickers."""
+        paths = sorted((self.out / 'data' / 'shares' / 'candles' / 'interval_60').rglob('*.parquet'))
+        paths += sorted((self.out / 'data' / 'shares' / 'candles' / 'interval_60').rglob('*.csv.gz'))
+        frames = []
+        for p in paths:
+            try:
+                df = pd.read_parquet(p) if p.suffix == '.parquet' else pd.read_csv(p)
+                if not df.empty:
+                    frames.append(df)
+            except Exception as e:
+                self.log_error('hourly_merge', '', '', str(p), e)
+        if frames:
+            df = pd.concat(frames, ignore_index=True)
+            sort_cols = [x for x in ('_secid', '_section', 'begin') if x in df]
+            if sort_cols:
+                df = df.sort_values(sort_cols)
+            try:
+                df.to_parquet(self.out / 'bank_equity_hourly_ALL_BOARDS.parquet', index=False)
+            except ImportError:
+                print('[WARN] pyarrow missing, hourly CSV.GZ still written', flush=True)
+            df.to_csv(self.out / 'bank_equity_hourly_ALL_BOARDS.csv.gz', index=False, compression='gzip')
+            print('[HOURLY]', len(df), 'rows', flush=True)
+            if {'_secid', '_section', 'begin'} <= set(df.columns):
+                dup = int(df.duplicated(['_secid', '_section', 'begin']).sum())
+                self.audits.append(dict(kind='hourly_merged', bank='', secid='', section='', interval=60,
+                                        rows=len(df), fatal=dup, warning=0, flag_counts={'duplicates': dup}))
+
+    def cross_interval_audit(self):
+        """Soft daily/hourly consistency check by security, board, calendar date.
+
+        MOEX trading sessions and candle boundaries may differ; flags are warnings,
+        not automatic corruption proofs. Unmatched days remain unmatched.
+        """
+        root = self.out / 'data' / 'shares' / 'candles'
+        if not root.exists():
+            return
+        checks = []
+        for hourly in sorted((root / 'interval_60').rglob('*.parquet')):
+            relative = hourly.relative_to(root / 'interval_60')
+            daily = root / 'interval_24' / relative
+            if not daily.exists():
+                continue
+            try:
+                h = pd.read_parquet(hourly)
+                d = pd.read_parquet(daily)
+                if h.empty or d.empty or not {'begin', 'open', 'high', 'low', 'close', 'volume'} <= set(h.columns) or not {'begin', 'open', 'high', 'low', 'close', 'volume'} <= set(d.columns):
+                    continue
+                h = h.copy()
+                d = d.copy()
+                h['_day'] = h['begin'].astype(str).str[:10]
+                d['_day'] = d['begin'].astype(str).str[:10]
+                for c in ('open', 'high', 'low', 'close', 'volume'):
+                    h[c] = pd.to_numeric(h[c], errors='coerce')
+                    d[c] = pd.to_numeric(d[c], errors='coerce')
+                hh = (h.sort_values('begin').groupby('_day')
+                      .agg(h_open=('open', 'first'), h_high=('high', 'max'),
+                           h_low=('low', 'min'), h_close=('close', 'last'),
+                           h_volume=('volume', 'sum'), hourly_bars=('begin', 'size')))
+                dd = d.drop_duplicates('_day').set_index('_day')
+                z = hh.join(dd, how='inner')
+                for day, r in z.iterrows():
+                    price_mismatch = (abs(r['h_close'] - r['close']) / max(abs(r['close']), 1e-10) > .02
+                                      or (r['h_high'] - r['high']) / max(abs(r['high']), 1e-10) > .02
+                                      or (r['low'] - r['h_low']) / max(abs(r['low']), 1e-10) > .02)
+                    vol_gap = abs(r['h_volume'] - r['volume']) / max(abs(r['volume']), 1) > .1
+                    checks.append(dict(secid=relative.parts[0], boardid=relative.parts[1],
+                        day=day, hourly_bars=int(r['hourly_bars']),
+                        hourly_close=float(r['h_close']), daily_close=float(r['close']),
+                        close_mismatch_gt2pct=bool(price_mismatch), volume_mismatch_gt10pct=bool(vol_gap),
+                        note='WARNING_ONLY: session coverage/auction boundaries may differ'))
+            except Exception as exc:
+                self.log_error('cross_interval_audit', '', '', str(hourly), exc)
+        if checks:
+            pd.DataFrame(checks).to_csv(self.out / 'cross_interval_consistency.csv', index=False,
+                                        encoding='utf-8-sig')
+
+    def report(self):
+        self.out.mkdir(parents=True, exist_ok=True)
+        if self.journal:
+            pd.DataFrame(self.journal).drop(columns=['qa', 'columns', 'params', 'pages'], errors='ignore').to_csv(
+                self.out / 'fetch_manifest.csv', index=False, encoding='utf-8-sig')
+        if self.audits:
+            pd.DataFrame(self.audits).to_csv(self.out / 'qa_by_partition.csv', index=False, encoding='utf-8-sig')
+        if self.issues:
+            pd.DataFrame(self.issues).to_csv(self.out / 'failed_requests_this_run.csv', index=False, encoding='utf-8-sig')
+        if self.optional_unavailable:
+            pd.DataFrame(self.optional_unavailable).to_csv(self.out / 'optional_endpoints_unavailable.csv', index=False, encoding='utf-8-sig')
+        succeeded = sum(x.get('status') in ('OK', 'EMPTY', 'CACHE') for x in self.journal)
+        qa_fatal = sum((x.get('qa') or {}).get('fatal', 0) for x in self.journal)
+        qa_fatal += sum(x.get('fatal', 0) for x in self.audits if x.get('kind') == 'hourly_merged')
+        output = dict(run_utc=now_utc(), api_base=BASE, code_version=VERSION,
+            source_http_requests=self.c.calls, securities_probed=len(self.mappings),
+            found_search_rows=len(self.discoveries), partitions_successful_or_cached=succeeded,
+            partitions_qa_fatal=qa_fatal, errors_this_run=len(self.issues),
+            optional_endpoints_unavailable=len(self.optional_unavailable),
+            stopped_early=self.stop_reason is not None, stop_reason=self.stop_reason,
+            current_run_without_errors=(len(self.issues) == 0 and qa_fatal == 0 and self.stop_reason is None),
+            full_historical_completeness_independently_verified=False,
+            important_limitations=[
+              'One-off orderbook/trades/marketdata snapshots are not historical archives',
+              'Issuer-name matching of securities is heuristic and requires external issuer verification',
+              'Listings of bank affiliates or parent holdings are not direct shares in banks',
+              'Public MOEX ISS access/retention/licensing may limit historical availability',
+              'Unadjusted prices; splits, consolidations, dividends and redomiciliations are not normalized',
+              'Different boardids and old/new secids are distinct series; do not blindly concatenate',
+              'Benchmarks and bank balances, financial reporting, key rate, inflation and news have different publishers',
+              'No fabricated missing observations or zero-volume trading hours'])
+        dump_json(self.out / 'RUN_SUMMARY.json', output)
+        print(json.dumps(output, indent=2, ensure_ascii=False), flush=True)
+        return output
+
+    def run(self):
+        print('[BEGIN]', now_utc(), 'output=', self.out, flush=True)
+        dump_json(self.out / 'reference' / 'requested_16_banks.json', BANKS)
+        try:
+            self.source_info()
+            mapping = self.discover()
+            print('[SELECTED]', len(mapping), 'securities; includes issuer-candidate bonds (verify)', flush=True)
+            active = sorted([x for x in mapping if x.get('verified_exists_in_iss')],
+                            key=lambda x: (x['asset_hint'] != 'shares',
+                                           x['selection'] != 'curated_equity_seed__VERIFY_BY_ISS',
+                                           x['bank'], x['secid']))
+            # First acquire the original ML task's hourly bank-share coverage for
+            # every listed/proxy security, BEFORE potentially millions of minute bars
+            # or thousands of bank bonds. These partitions are reused later.
+            print('[PHASE 1] Equity 60-minute bars across all banks', flush=True)
+            for item in active:
+                if item['asset_hint'] == 'shares' and 60 in self.cfg['share_intervals']:
+                    for board in item['eligible_boards']:
+                        self.download_candles(item, board, interval_override=[60])
+            print('[PHASE 2] All remaining market, corporate, and snapshot tables', flush=True)
+            for i, item in enumerate(active, 1):
+                print(f'[PROGRESS] {i}/{len(active)} {item["bank"]} / {item["secid"]}', flush=True)
+                self.get_reference(item)
+                for board in item['eligible_boards']:
+                    if self.cfg['include_daily_history']:
+                        self.download_history(item, board)
+                    self.download_candles(item, board)
+                    self.snapshots(item, board)
+            self.benchmarks()
+        except HTTPProblem as e:
+            if e.status == 'LIMIT':
+                self.stop_reason = 'REQUEST_LIMIT_REACHED'
+                print('[PAUSED] Request cap reached. Rerun the cell with unchanged directory.', flush=True)
+            else:
+                self.log_error('run', '', '', '', e)
+        except Exception as e:
+            self.log_error('run_unexpected', '', '', '', e)
+        finally:
+            self.build_hourly()
+            self.cross_interval_audit()
+            self.report()
+        return self.issues
+
+
+def audit_rows(rows, kind, secid):
+    """Independent per-partition checks, no row removal or changing source values."""
+    out = {'rows': len(rows), 'fatal': 0, 'warning': 0, 'flag_counts': {}}
+    if not rows:
+        return out
+    df = pd.DataFrame(rows)
+    counts = Counter()
+    if kind == 'candles' and {'begin', 'end'} <= set(df.columns):
+        begin, end = pd.to_datetime(df['begin'], errors='coerce'), pd.to_datetime(df['end'], errors='coerce')
+        counts['invalid_candle_time'] += int((begin.isna() | end.isna() | (begin >= end)).sum())
+        counts['duplicate_begin'] += int(df['begin'].duplicated().sum())
+    if kind == 'history':
+        col = 'tradedate' if 'tradedate' in df.columns else 'trade_date' if 'trade_date' in df.columns else None
+        if col:
+            counts['invalid_trading_date'] += int(pd.to_datetime(df[col], errors='coerce').isna().sum())
+            if 'boardid' in df:
+                counts['duplicate_history_date_board'] += int(df.duplicated([col, 'boardid']).sum())
+    if kind == 'candles' and {'open', 'high', 'low', 'close'} <= set(df.columns):
+        num = {c: pd.to_numeric(df[c], errors='coerce') for c in ('open', 'high', 'low', 'close')}
+        bad = (~pd.DataFrame(num).map(math.isfinite)).any(axis=1)
+        bad |= (pd.DataFrame(num) <= 0).any(axis=1)
+        bad |= (num['high'] + 1e-9 < pd.DataFrame(num).max(axis=1))
+        bad |= (num['low'] - 1e-9 > pd.DataFrame(num).min(axis=1))
+        counts['invalid_ohlc'] += int(bad.sum())
+        if 'volume' in df:
+            v = pd.to_numeric(df['volume'], errors='coerce')
+            counts['invalid_volume'] += int((v.isna() | (v < 0)).sum())
+        if 'value' in df:
+            v = pd.to_numeric(df['value'], errors='coerce')
+            counts['invalid_value'] += int((v.isna() | (v < 0)).sum())
+        cl = num['close']
+        jumps = cl / cl.shift(1) - 1
+        counts['large_close_change_gt50pct_WARNING'] += int((jumps.abs() > .5).sum())
+    out['fatal'] = sum(v for k, v in counts.items() if not k.endswith('_WARNING'))
+    out['warning'] = sum(v for k, v in counts.items() if k.endswith('_WARNING'))
+    out['flag_counts'] = dict(counts)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--out', required=True)
+    ap.add_argument('--config', default=None, help='JSON configuration file')
+    args = ap.parse_args()
+    cfg = json.loads(Path(args.config).read_text(encoding='utf-8')) if args.config else {}
+    issues = Builder(args.out, cfg).run()
+    if issues:
+        sys.exit(2)
+
+
+if __name__ == '__main__':
+    main()
+
+
+--- CELL ---
+
+## 3. Автоматические локальные тесты
+Проверяются пагинация, валидность OHLC, дубликаты, привязка эмитента и возобновление выгрузки. **Тесты используют имитацию ISS**, не реальные котировки.
+
+--- CELL ---
+
+%%writefile /content/test_collector.py
+import json
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from collector import (BANKS, Builder, Client, audit_rows, cursor, normalize, safe, tbl)
+
+
+def test_iss_table_to_records():
+    body = {'candles': {'columns': ['BEGIN', 'OPEN'], 'data': [['2024-01-01', 123.4]]}}
+    assert tbl(body, 'candles') == [{'begin': '2024-01-01', 'open': 123.4}]
+    assert tbl({}, 'candles') is None
+
+
+def test_cursor():
+    d = {'history.cursor': {'columns': ['INDEX', 'TOTAL', 'PAGESIZE'], 'data': [[0, 40, 20]]}}
+    assert cursor(d, 'history')['total'] == 40
+
+
+def test_pagination_complete_without_cursor():
+    c = object.__new__(Client)
+    c.cfg = {'max_pages_per_partition': 100}
+    calls = []
+    def fake(url, **params):
+        calls.append(params['start'])
+        data = [{"id": 1}, {"id": 2}] if params['start'] == 0 else [{"id": 3}] if params['start'] == 2 else []
+        return {'history': {'columns': ['id'], 'data': [[r['id']] for r in data]}}
+    c.get = fake
+    result, info = c.pages('/iss/history.json', 'history')
+    assert [r['id'] for r in result] == [1, 2, 3]
+    assert calls == [0, 2, 3]
+    assert info['pages'] == 3
+
+
+def test_pagination_complete_with_cursor():
+    c = object.__new__(Client)
+    c.cfg = {'max_pages_per_partition': 100}
+    def fake(url, **params):
+        start = params['start']
+        data = [[start + 1], [start + 2]]
+        return {'candles': {'columns': ['ID'], 'data': data},
+                'candles.cursor': {'columns': ['TOTAL'], 'data': [[4]]}}
+    c.get = fake
+    rows, info = c.pages('/x', 'candles')
+    assert len(rows) == 4 and info['cursor_total'] == 4
+
+
+def test_repeat_page_is_error():
+    c = object.__new__(Client)
+    c.cfg = {'max_pages_per_partition': 100}
+    c.get = lambda url, **params: {'history': {'columns': ['id'], 'data': [[1], [2]]}}
+    with pytest.raises(ValueError, match='repeated'):
+        c.pages('/x', 'history')
+
+
+def test_ohlc_valid_and_invalid():
+    good = [{'begin': '2025-01-01 10:00:00', 'end': '2025-01-01 11:00:00',
+             'open': 100, 'high': 120, 'low': 99, 'close': 115, 'volume': 30, 'value': 3100}]
+    assert audit_rows(good, 'candles', 'SBER')['fatal'] == 0
+    bad = [dict(good[0], high=90)]
+    r = audit_rows(bad, 'candles', 'SBER')
+    assert r['fatal'] > 0 and r['flag_counts']['invalid_ohlc'] == 1
+
+
+def test_no_synthetic_gaps():
+    good = [{'begin': '2025-01-01 10:00:00', 'end': '2025-01-01 11:00:00',
+             'open': 100, 'high': 100, 'low': 100, 'close': 100},
+            {'begin': '2025-01-07 10:00:00', 'end': '2025-01-07 11:00:00',
+             'open': 110, 'high': 110, 'low': 110, 'close': 110}]
+    assert audit_rows(good, 'candles', 'SBER')['rows'] == 2
+
+
+def test_duplicate_begin_is_fatal():
+    r = [{'begin': '2025-01-01 10:00:00', 'end': '2025-01-01 11:00:00',
+          'open': 100, 'high': 101, 'low': 99, 'close': 100}]
+    assert audit_rows(r + r, 'candles', 'SBER')['flag_counts']['duplicate_begin'] == 1
+
+
+def test_daily_history_duplicates():
+    r = [{'tradedate': '2025-01-01', 'boardid': 'TQBR'}, {'tradedate': '2025-01-01', 'boardid': 'TQBR'}]
+    assert audit_rows(r, 'history', 'SBER')['fatal'] == 1
+
+
+def test_bank_issuer_heuristic_excludes_affiliates(tmp_path):
+    b = Builder(tmp_path, {})
+    sber = next(x for x in BANKS if x['bank'] == 'Сбербанк')
+    assert b.match({'emitent_title': 'ПАО Сбербанк России'}, sber) == 'issuer_name_match__REVIEW'
+    assert b.match({'emitent_title': 'ООО Сбербанк Лизинг'}, sber) != 'issuer_name_match__REVIEW'
+    vtb = next(x for x in BANKS if x['bank'] == 'ВТБ')
+    assert b.match({'emitent_title': 'ПАО Банк ВТБ'}, vtb) == 'issuer_name_match__REVIEW'
+    assert b.match({'emitent_title': 'АО ВТБ Лизинг'}, vtb) != 'issuer_name_match__REVIEW'
+
+
+def test_board_year_bounds(tmp_path):
+    b = Builder(tmp_path, {'start': '1990-01-01', 'end': '2026-11-23'})
+    years = b.date_intervals({'history_from': '2024-10-05', 'history_till': '2025-02-12'})
+    assert years == [(2024, '2024-10-05', '2024-12-31'), (2025, '2025-01-01', '2025-02-12')]
+
+
+def test_store_and_cache(tmp_path):
+    b = Builder(tmp_path, {'refresh_current_year': False})
+    r = [{'open': 100, 'high': 101, 'low': 98, 'close': 100,
+          'begin': '2020-01-01 10:00:00', 'end': '2020-01-01 11:00:00', 'volume': 1, 'value': 100}]
+    b.store('data/shares/candles/interval_60/SBER/TQBR/2020', r, 'candles', 'Сбербанк', 'SBER', 'shares/TQBR', 60,
+            {'interval': 60, 'from': '2020-01-01', 'till': '2020-12-31', 'year': 2020})
+    side = tmp_path / 'data/shares/candles/interval_60/SBER/TQBR/2020.meta.json'
+    assert json.loads(side.read_text())['status'] == 'OK'
+    assert Path(json.loads(side.read_text())['file']).exists()
+    def fail(*a, **kw):
+        pytest.fail('Should have used cache')
+    b.c.pages = fail
+    b.fetch('data/shares/candles/interval_60/SBER/TQBR/2020', '/unused', 'candles', 'candles',
+            'Сбербанк', 'SBER', 'shares/TQBR', 60,
+            {'interval': 60, 'from': '2020-01-01', 'till': '2020-12-31', 'year': 2020})
+    assert b.journal[-1]['status'] == 'CACHE'
+
+
+def test_full_16_bank_universe():
+    assert len(BANKS) == 16
+    assert len(set(x['bank'] for x in BANKS)) == 16
+
+
+def test_end_to_end_fake_iss_no_network(tmp_path):
+    b = Builder(tmp_path, {
+        'start': '2020-01-01', 'end': '2020-12-31',
+        'share_intervals': [60, 24],
+        'include_corporate_reference': False,
+        'include_market_reference': False,
+        'include_snapshots': False,
+        'benchmarks': [], 'fx_instruments': [],
+        'refresh_current_year': False,
+    })
+    item = {'bank': 'Сбербанк', 'secid': 'SBER', 'asset_hint': 'shares',
+            'selection': 'curated_equity_seed__VERIFY_BY_ISS', 'verified_exists_in_iss': True,
+            'eligible_boards': [{'engine': 'stock', 'market': 'shares', 'boardid': 'TQBR',
+                                 'history_from': '2020-01-01', 'history_till': '2020-12-31'}]}
+    b.discover = lambda: [item]
+    def fake_pages(endpoint, table, params=None, max_pages=None):
+        if table == 'candles':
+            rows = [{'begin': '2020-10-01 10:00:00', 'end': '2020-10-01 11:00:00',
+                     'open': 100, 'high': 110, 'low': 99, 'close': 105, 'volume': 100, 'value': 10500}]
+        else:
+            rows = [{'tradedate': '2020-10-01', 'boardid': 'TQBR', 'close': 105, 'numtrades': 55}]
+        return rows, {'pages': 1, 'cursor_total': len(rows)}
+    b.c.pages = fake_pages
+    assert b.run() == []
+    assert (tmp_path / 'bank_equity_hourly_ALL_BOARDS.csv.gz').exists()
+    report = json.loads((tmp_path / 'RUN_SUMMARY.json').read_text())
+    assert report['partitions_successful_or_cached'] >= 3
+    assert report['source_http_requests'] == 0  # mocked API
+    assert report['full_historical_completeness_independently_verified'] is False
+
+
+def test_limit_is_not_reported_as_complete(tmp_path):
+    from collector import HTTPProblem
+    b = Builder(tmp_path, {'include_market_reference': False, 'benchmarks': [], 'fx_instruments': []})
+    b.discover = lambda: [{'bank': 'Сбербанк', 'secid': 'SBER', 'asset_hint': 'shares',
+                           'selection': 'curated_equity_seed__VERIFY_BY_ISS', 'verified_exists_in_iss': True,
+                           'eligible_boards': [{'engine': 'stock', 'market': 'shares', 'boardid': 'TQBR'}]}]
+    b.c.pages = lambda *args, **kw: (_ for _ in ()).throw(HTTPProblem('LIMIT', 'synthetic capped run'))
+    b.run()
+    report = json.loads((tmp_path / 'RUN_SUMMARY.json').read_text())
+    assert report['stopped_early'] is True
+    assert report['current_run_without_errors'] is False
+
+
+def test_client_tls_verification_enabled():
+    import certifi
+    c = Client({'pause_seconds': 0, 'max_requests_per_run': 0})
+    assert c.session.verify == certifi.where()
+    assert c.session.trust_env is True
+    assert c.session.verify is not False
+
+
+def test_client_custom_trusted_ca_path():
+    c = Client({'tls_ca_bundle': '/tmp/organization-verified-combined-ca.pem', 'use_env_proxy': False})
+    assert c.session.verify == '/tmp/organization-verified-combined-ca.pem'
+    assert c.session.trust_env is False
+
+
+--- CELL ---
+
+import subprocess
+import sys
+res = subprocess.run([sys.executable, '-m', 'pytest', '-q', '/content/test_collector.py'], cwd='/content', check=False)
+if res.returncode:
+    raise RuntimeError(f'Локальные тесты завершились с ошибкой {res.returncode}')
+
+
+--- CELL ---
+
+## 4. Реальный сбор по API Московской биржи
+Скачивает все доступные годовые разделы, отмечает отсутствие ответов, сохраняет исходные столбцы и метаданные. При остановке процесса просто повторно запусти эту ячейку в той же папке Drive.
+
+--- CELL ---
+
+import subprocess
+import sys
+res = subprocess.run([sys.executable, '/content/collector.py', '--out', str(OUT),
+                      '--config', str(OUT / 'user_config.json')], check=False)
+print('Код завершения:', res.returncode)
+if res.returncode:
+    print('Часть запросов не удалась: смотри errors.jsonl и RUN_SUMMARY.json. Уже скачанные годы сохранены.')
+
+
+--- CELL ---
+
+## 5. Полнота и качество
+Смотри реальные показатели загрузки, найденные SECID/ISIN, нарушения OHLC/дубликаты, ошибки запросов и сверку почасовых и дневных рядов.
+
+--- CELL ---
+
+import json
+import pandas as pd
+from pathlib import Path
+p = OUT / 'RUN_SUMMARY.json'
+if p.exists():
+    display(pd.Series(json.loads(p.read_text(encoding='utf-8')), name='Значение').to_frame())
+else:
+    print('Пока нет отчёта: сбор не запускался.')
+for fn in ['reference/bank_security_map.csv', 'fetch_manifest.csv',
+           'qa_by_partition.csv', 'cross_interval_consistency.csv',
+           'failed_requests_this_run.csv', 'optional_endpoints_unavailable.csv']:
+    f = OUT / fn
+    if f.exists():
+        d = pd.read_csv(f)
+        print(fn, '| строк:', len(d))
+        display(d.head(10))
+h = OUT / 'bank_equity_hourly_ALL_BOARDS.parquet'
+if h.exists():
+    d = pd.read_parquet(h)
+    print('Почасовых свечей акций:', len(d))
+    display(d.head(10))
+
+
+--- CELL ---
+
+## 6. Результат и архивы
+Отчёты можно скачать небольшим ZIP. Большие исторические ряды лучше читать непосредственно из каталога Google Drive.
+
+--- CELL ---
+
+import zipfile
+from google.colab import files
+summary_zip = Path('/content/MOEX_BANKS_METADATA_QA.zip')
+with zipfile.ZipFile(summary_zip, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as z:
+    for name in ['user_config.json', 'config_and_provenance.json', 'RUN_SUMMARY.json',
+                 'fetch_manifest.csv', 'qa_by_partition.csv', 'cross_interval_consistency.csv',
+                 'failed_requests_this_run.csv', 'optional_endpoints_unavailable.csv', 'errors.jsonl',
+                 'reference/bank_security_map.csv', 'reference/bank_security_map.json']:
+        f = OUT / name
+        if f.is_file():
+            z.write(f, name)
+print('Архив QA:', summary_zip)
+files.download(str(summary_zip))
+
+
+--- CELL ---
+
+# Дополнительно: создать архив ВСЕХ котировок и облигаций (возможны многие гигабайты).
+MAKE_FULL_ZIP = False
+if MAKE_FULL_ZIP:
+    import zipfile
+    full_zip = Path('/content/MOEX_BANKS_FULL_DATA.zip')
+    with zipfile.ZipFile(full_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=3, allowZip64=True) as z:
+        for f in OUT.rglob('*'):
+            if f.is_file():
+                z.write(f, str(f.relative_to(OUT)))
+    print('Полный архив:', full_zip)
+else:
+    print('Все данные лежат в', OUT)
+
+
+--- CELL ---
+
+## Интерпретация для прогнозирования котировок
+- `SECID` и `BOARDID` — ключи ряда; не склеивайте обыкновенные и привилегированные бумаги, акции группы и исторические депозитарные расписки.
+- Данные не скорректированы на дивиденды, сплиты, консолидации и редомициляции; пропущенные часы не заполнены.
+- Рынок облигаций и котировки акций — разные сущности; столбцы дневной истории зависят от инструмента и режима торгов.
+- В `RUN_SUMMARY.json` и `errors.jsonl` есть ограничения реальной загрузки. Отсутствие ошибок в тестах **не означает** полноты ответа MOEX ISS.
+
+- SSL: TLS certificate verification is enabled; a failing CA chain must be diagnosed, not bypassed with `verify=False`.
